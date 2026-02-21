@@ -2,6 +2,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pyvista as pv
 import hashlib
+import json
+from pathlib import Path
+from urllib.error import URLError
+from urllib.request import urlopen
+
+
+STANDARD_AMINO_ACIDS = [
+    "ALA", "ARG", "ASN", "ASP", "CYS",
+    "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO",
+    "SER", "THR", "TRP", "TYR", "VAL",
+]
+RCSB_IDEAL_SDF_URL = "https://files.rcsb.org/ligands/download/{ccd_id}_ideal.sdf"
 
 
 def rewrite(s: str, rules: dict[str, str], steps: int) -> str:
@@ -24,8 +37,8 @@ def rot_pitch(angle):
 def turtle_3d(
     commands: str,
     step: float = 1.0,
-    yaw=np.deg2rad(20),
-    pitch=np.deg2rad(15),
+    yaw=np.deg2rad(30),
+    pitch=np.deg2rad(30),
     max_points: int | None = None,
 ):
     """
@@ -63,6 +76,7 @@ def generate_random_genome(length: int, seed: int) -> str:
 
 def build_amino_programs(points_per_codon: int = 30) -> dict[str, str]:
     """
+    Legacy random baseline (kept for comparison experiments).
     Build one deterministic "amino-acid program" for each codon (111..333).
     Each program emits exactly points_per_codon forward moves ("1").
     """
@@ -94,6 +108,284 @@ def build_amino_programs(points_per_codon: int = 30) -> dict[str, str]:
         programs[codon] = "".join(cmd)
 
     return programs
+
+
+def all_codons() -> list[str]:
+    return [a + b + c for a in "123" for b in "123" for c in "123"]
+
+
+def parse_v2000_sdf_atoms(sdf_text: str) -> list[dict[str, float | str]]:
+    lines = sdf_text.splitlines()
+    if len(lines) < 4:
+        raise ValueError("SDF text is too short")
+
+    counts = lines[3]
+    try:
+        atom_count = int(counts[0:3])
+    except ValueError:
+        atom_count = int(counts.split()[0])
+
+    atoms: list[dict[str, float | str]] = []
+    start = 4
+    end = start + atom_count
+    if len(lines) < end:
+        raise ValueError("SDF text does not contain declared atom block")
+
+    for line in lines[start:end]:
+        x = float(line[0:10])
+        y = float(line[10:20])
+        z = float(line[20:30])
+        element = line[31:34].strip()
+        atoms.append({"element": element, "x": x, "y": y, "z": z})
+    return atoms
+
+
+def fetch_rcsb_amino_acid_shapes(
+    *,
+    amino_acids: list[str] | None = None,
+    include_hydrogens: bool = True,
+    timeout: float = 20.0,
+) -> dict[str, list[dict[str, float | str]]]:
+    """
+    Download idealized atom coordinates for amino acids from the RCSB ligand endpoint.
+    """
+    aa_codes = amino_acids if amino_acids is not None else STANDARD_AMINO_ACIDS
+    shapes: dict[str, list[dict[str, float | str]]] = {}
+
+    for aa in aa_codes:
+        url = RCSB_IDEAL_SDF_URL.format(ccd_id=aa)
+        try:
+            with urlopen(url, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8")
+        except URLError as exc:
+            raise RuntimeError(f"Failed to download {aa} from {url}: {exc}") from exc
+
+        atoms = parse_v2000_sdf_atoms(text)
+        if not include_hydrogens:
+            atoms = [a for a in atoms if str(a["element"]).upper() != "H"]
+        if not atoms:
+            raise RuntimeError(f"No atoms parsed for amino acid {aa}")
+        shapes[aa] = atoms
+
+    return shapes
+
+
+def load_or_build_amino_shapes(
+    *,
+    cache_dir: str | Path = ".algogen_cache",
+    include_hydrogens: bool = True,
+    force_refresh: bool = False,
+) -> tuple[dict[str, list[dict[str, float | str]]], Path, str]:
+    """
+    Load amino-acid shapes from local cache; fetch from RCSB if cache is absent/invalid.
+    """
+    cache_dir = Path(cache_dir)
+    atom_mode = "all" if include_hydrogens else "heavy"
+    cache_path = cache_dir / f"amino_acid_shapes_{atom_mode}_atoms.json"
+
+    if not force_refresh and cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            shapes = data.get("shapes")
+            if isinstance(shapes, dict) and all(aa in shapes for aa in STANDARD_AMINO_ACIDS):
+                return shapes, cache_path, "loaded"
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    shapes = fetch_rcsb_amino_acid_shapes(include_hydrogens=include_hydrogens)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "source": "RCSB Ligand ideal SDF",
+        "source_url_template": RCSB_IDEAL_SDF_URL,
+        "include_hydrogens": include_hydrogens,
+        "shapes": shapes,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return shapes, cache_path, "fetched"
+
+
+def nearest_neighbor_order(points: np.ndarray) -> np.ndarray:
+    n = points.shape[0]
+    if n <= 2:
+        return points
+
+    remaining = set(range(1, n))
+    order = [0]
+    while remaining:
+        last = order[-1]
+        nxt = min(remaining, key=lambda i: np.linalg.norm(points[i] - points[last]))
+        order.append(nxt)
+        remaining.remove(nxt)
+    return points[np.array(order, dtype=int)]
+
+
+def amino_atoms_to_turtle_commands(
+    atoms: list[dict[str, float | str]],
+    *,
+    turn_angle_deg: float = 30.0,
+) -> str:
+    if turn_angle_deg <= 0 or turn_angle_deg >= 360:
+        raise ValueError("turn_angle_deg must be in (0, 360)")
+
+    pts = np.array([[float(a["x"]), float(a["y"]), float(a["z"])] for a in atoms], dtype=float)
+    pts = pts - pts.mean(axis=0, keepdims=True)
+    pts = nearest_neighbor_order(pts)
+
+    turn_angle = np.deg2rad(turn_angle_deg)
+    turns_per_rev = max(1, int(round((2.0 * np.pi) / turn_angle)))
+    yaw_mats = [np.linalg.matrix_power(rot_yaw(turn_angle), k) for k in range(turns_per_rev)]
+    pitch_mats = [np.linalg.matrix_power(rot_pitch(turn_angle), k) for k in range(turns_per_rev)]
+
+    R = np.eye(3)
+    forward = np.array([1.0, 0.0, 0.0])
+    commands: list[str] = []
+
+    for i in range(len(pts) - 1):
+        vec = pts[i + 1] - pts[i]
+        dist = float(np.linalg.norm(vec))
+        if dist < 1e-9:
+            continue
+        target_dir = vec / dist
+
+        best_yaw = 0
+        best_pitch = 0
+        best_score = -np.inf
+        for yaw_steps in range(turns_per_rev):
+            Ry = R @ yaw_mats[yaw_steps]
+            for pitch_steps in range(turns_per_rev):
+                cand_R = Ry @ pitch_mats[pitch_steps]
+                score = float(np.dot(cand_R @ forward, target_dir))
+                if score > best_score:
+                    best_score = score
+                    best_yaw = yaw_steps
+                    best_pitch = pitch_steps
+
+        if best_yaw:
+            commands.append("2" * best_yaw)
+        if best_pitch:
+            commands.append("3" * best_pitch)
+        R = R @ yaw_mats[best_yaw] @ pitch_mats[best_pitch]
+        commands.append("1")
+
+    return "".join(commands)
+
+
+def build_real_amino_programs(
+    amino_shapes: dict[str, list[dict[str, float | str]]],
+    *,
+    turn_angle_deg: float = 30.0,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Build codon programs from real amino-acid atom geometries.
+    Returns:
+      - codon -> turtle commands
+      - codon -> amino-acid code
+    """
+    amino_commands: dict[str, str] = {}
+    for aa in STANDARD_AMINO_ACIDS:
+        atoms = amino_shapes[aa]
+        amino_commands[aa] = amino_atoms_to_turtle_commands(atoms, turn_angle_deg=turn_angle_deg)
+
+    codons = all_codons()
+    codon_to_aa: dict[str, str] = {}
+    codon_programs: dict[str, str] = {}
+    for i, codon in enumerate(codons):
+        aa = STANDARD_AMINO_ACIDS[i % len(STANDARD_AMINO_ACIDS)]
+        codon_to_aa[codon] = aa
+        codon_programs[codon] = amino_commands[aa]
+
+    return codon_programs, codon_to_aa
+
+
+def load_or_build_real_amino_programs(
+    *,
+    cache_dir: str | Path = ".algogen_cache",
+    include_hydrogens: bool = True,
+    turn_angle_deg: float = 30.0,
+    force_rebuild: bool = False,
+    force_refresh_shapes: bool = False,
+) -> tuple[dict[str, str], dict[str, str], Path, str, Path, str]:
+    """
+    Cache-aware real amino-acid command builder based on RCSB ideal SDF coordinates.
+    """
+    cache_dir = Path(cache_dir)
+    atom_mode = "all" if include_hydrogens else "heavy"
+    tag = f"{atom_mode}_angle{turn_angle_deg:.2f}".replace(".", "p")
+    prog_cache_path = cache_dir / f"amino_programs_real_{tag}.json"
+
+    if not force_rebuild and prog_cache_path.exists():
+        try:
+            with prog_cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            programs = data.get("programs")
+            codon_to_aa = data.get("codon_to_amino")
+            if isinstance(programs, dict) and isinstance(codon_to_aa, dict):
+                if all(c in programs for c in all_codons()):
+                    shapes_path = cache_dir / f"amino_acid_shapes_{atom_mode}_atoms.json"
+                    return programs, codon_to_aa, prog_cache_path, "loaded", shapes_path, "unknown"
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    amino_shapes, shapes_cache_path, shapes_status = load_or_build_amino_shapes(
+        cache_dir=cache_dir,
+        include_hydrogens=include_hydrogens,
+        force_refresh=force_refresh_shapes,
+    )
+    programs, codon_to_aa = build_real_amino_programs(
+        amino_shapes,
+        turn_angle_deg=turn_angle_deg,
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "source": "RCSB ideal SDF -> turtle approximation",
+        "include_hydrogens": include_hydrogens,
+        "turn_angle_deg": turn_angle_deg,
+        "codon_to_amino": codon_to_aa,
+        "programs": programs,
+    }
+    with prog_cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return programs, codon_to_aa, prog_cache_path, "built", shapes_cache_path, shapes_status
+
+
+def load_or_build_amino_programs(
+    points_per_codon: int = 30,
+    *,
+    cache_dir: str | Path = ".algogen_cache",
+    force_rebuild: bool = False,
+) -> tuple[dict[str, str], Path, str]:
+    """
+    Legacy random-baseline cache loader (not used in the real-shape pipeline).
+    Load amino programs from disk cache if available, otherwise build and cache them.
+    """
+    cache_dir = Path(cache_dir)
+    cache_path = cache_dir / f"amino_programs_ppc{points_per_codon}.json"
+
+    if not force_rebuild and cache_path.exists():
+        try:
+            with cache_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            programs = data.get("programs")
+            cached_ppc = data.get("points_per_codon")
+            if isinstance(programs, dict) and cached_ppc == points_per_codon:
+                return {str(k): str(v) for k, v in programs.items()}, cache_path, "loaded"
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    programs = build_amino_programs(points_per_codon=points_per_codon)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format_version": 1,
+        "points_per_codon": points_per_codon,
+        "programs": programs,
+    }
+    with cache_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return programs, cache_path, "built"
 
 
 def expand_genome_to_commands(genome: str, amino_programs: dict[str, str]) -> tuple[str, int]:
@@ -205,6 +497,112 @@ def expand_genome_start_stop(
     return "".join(commands), metadata
 
 
+def mutate_genome(genome: str, mutation_count: int, seed: int) -> tuple[str, list[dict[str, int | str]]]:
+    """
+    Apply `mutation_count` point mutations at unique positions.
+    Each mutation flips one digit to one of the other two values in {"1","2","3"}.
+    """
+    if mutation_count < 0:
+        raise ValueError("mutation_count must be >= 0")
+    if mutation_count == 0 or not genome:
+        return genome, []
+
+    n = len(genome)
+    actual_count = min(mutation_count, n)
+    rng = np.random.default_rng(seed)
+    indices = sorted(int(i) for i in rng.choice(n, size=actual_count, replace=False))
+
+    chars = list(genome)
+    mutations: list[dict[str, int | str]] = []
+    for idx in indices:
+        old = chars[idx]
+        candidates = [d for d in "123" if d != old]
+        new = candidates[int(rng.integers(0, len(candidates)))]
+        chars[idx] = new
+        mutations.append({"index": idx, "old": old, "new": new})
+
+    return "".join(chars), mutations
+
+
+def run_pipeline_for_genome(
+    genome: str,
+    amino_programs: dict[str, str],
+    *,
+    step: float,
+    yaw: float,
+    pitch: float,
+    start_codon: str,
+    stop_codon: str,
+    target_points: int,
+    max_genes: int,
+) -> tuple[str, list[dict[str, float | int]], list[tuple[float, float, float]]]:
+    expanded, genes = expand_genome_start_stop(
+        genome,
+        amino_programs,
+        start_codon=start_codon,
+        stop_codon=stop_codon,
+        target_points=target_points,
+        max_genes=max_genes,
+    )
+    points = turtle_3d(
+        expanded,
+        step=step,
+        yaw=yaw,
+        pitch=pitch,
+        max_points=target_points,
+    )
+    return expanded, genes, points
+
+
+def compare_runs(
+    base_genes: list[dict[str, float | int]],
+    mut_genes: list[dict[str, float | int]],
+    base_points: list[tuple[float, float, float]],
+    mut_points: list[tuple[float, float, float]],
+) -> dict[str, float | int | None]:
+    overlap_genes = min(len(base_genes), len(mut_genes))
+    changed_genes = 0
+    first_changed_gene: int | None = None
+
+    for i in range(overlap_genes):
+        a = base_genes[i]
+        b = mut_genes[i]
+        same = (
+            a["start_idx"] == b["start_idx"]
+            and a["stop_idx"] == b["stop_idx"]
+            and a["codons"] == b["codons"]
+            and a["next_search_idx"] == b["next_search_idx"]
+            and abs(float(a["jump_fraction"]) - float(b["jump_fraction"])) < 1e-12
+        )
+        if not same:
+            changed_genes += 1
+            if first_changed_gene is None:
+                first_changed_gene = i + 1
+
+    a_pts = np.asarray(base_points, dtype=float)
+    b_pts = np.asarray(mut_points, dtype=float)
+    overlap_points = min(len(a_pts), len(b_pts))
+    mean_displacement = 0.0
+    max_displacement = 0.0
+    if overlap_points > 0:
+        d = np.linalg.norm(a_pts[:overlap_points] - b_pts[:overlap_points], axis=1)
+        mean_displacement = float(d.mean())
+        max_displacement = float(d.max())
+
+    return {
+        "base_genes": len(base_genes),
+        "mutated_genes": len(mut_genes),
+        "overlap_genes": overlap_genes,
+        "changed_overlap_genes": changed_genes,
+        "first_changed_gene": first_changed_gene,
+        "base_points": len(base_points),
+        "mutated_points": len(mut_points),
+        "overlap_points": overlap_points,
+        "mean_point_displacement": mean_displacement,
+        "max_point_displacement": max_displacement,
+    }
+
+
 def sequential_spheres(points: np.ndarray, r1_mode: str = "half_next", eps: float = 0.0) -> np.ndarray:
     """
     Ordered greedy sphere growth:
@@ -244,69 +642,6 @@ def sequential_spheres(points: np.ndarray, r1_mode: str = "half_next", eps: floa
         r[i] = max(0.0, ri)
 
     return r
-
-def plot_spheres_matplotlib(points, radii, 
-                           show_centers=True,
-                           sphere_resolution=16,
-                           alpha=0.35,
-                           cmap="viridis"):
-    """
-    Visualize spheres with matplotlib 3D.
-
-    points: (N,3) array
-    radii: (N,) array
-    sphere_resolution: sphere mesh density (8–24 is reasonable)
-    alpha: sphere transparency
-    cmap: color map by radius
-    """
-
-    pts = np.asarray(points)
-    r = np.asarray(radii)
-    N = len(pts)
-
-    # Setup figure
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
-    # Normalize colors by radius
-    norm = (r - r.min()) / (r.max() - r.min() + 1e-12)
-    colors = plt.get_cmap(cmap)(norm)
-
-    # Precompute sphere mesh
-    u = np.linspace(0, 2*np.pi, sphere_resolution)
-    v = np.linspace(0, np.pi, sphere_resolution)
-    uu, vv = np.meshgrid(u, v)
-
-    for i in range(N):
-        if r[i] <= 0:
-            continue
-
-        x0, y0, z0 = pts[i]
-
-        xs = x0 + r[i] * np.cos(uu) * np.sin(vv)
-        ys = y0 + r[i] * np.sin(uu) * np.sin(vv)
-        zs = z0 + r[i] * np.cos(vv)
-
-        ax.plot_wireframe(xs, ys, zs, linewidth=0.3, alpha=0.4)
-
-
-    # Optional centers
-    if show_centers:
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
-                   c="black", s=5, alpha=0.6)
-
-    # Equal aspect ratio (important!)
-    max_range = (pts.max(axis=0) - pts.min(axis=0)).max()
-    center = pts.mean(axis=0)
-
-    ax.set_xlim(center[0] - max_range/2, center[0] + max_range/2)
-    ax.set_ylim(center[1] - max_range/2, center[1] + max_range/2)
-    ax.set_zlim(center[2] - max_range/2, center[2] + max_range/2)
-
-    ax.set_box_aspect([1, 1, 1])
-    ax.set_title("Sequential Sphere Growth")
-    plt.tight_layout()
-    plt.show()
 
 def show_spheres_pyvista(points, radii, *,
                          sphere_radius=1.0,
@@ -363,33 +698,161 @@ def show_spheres_pyvista(points, radii, *,
     pl.show_grid()
     pl.show()    
 
+
+def show_single_amino_acid_pyvista(
+    amino_acid: str,
+    *,
+    cache_dir: str | Path = ".algogen_cache",
+    include_hydrogens: bool = True,
+    turn_angle_deg: float = 30.0,
+    step: float = 1.0,
+    notebook: bool = False,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    Plot one amino acid as:
+      - real atom coordinates (RCSB ideal SDF)
+      - turtle-reconstructed polyline from the same amino acid
+
+    Returns (atom_points_centered, turtle_points_aligned, command_string).
+    """
+    aa = amino_acid.upper()
+    if aa not in STANDARD_AMINO_ACIDS:
+        raise ValueError(f"Unknown amino acid '{amino_acid}'. Use one of: {STANDARD_AMINO_ACIDS}")
+
+    shapes, _, _ = load_or_build_amino_shapes(
+        cache_dir=cache_dir,
+        include_hydrogens=include_hydrogens,
+        force_refresh=False,
+    )
+    atoms = shapes[aa]
+    atom_points = np.array([[float(a["x"]), float(a["y"]), float(a["z"])] for a in atoms], dtype=float)
+    atom_points_centered = atom_points - atom_points.mean(axis=0, keepdims=True)
+
+    commands = amino_atoms_to_turtle_commands(atoms, turn_angle_deg=turn_angle_deg)
+    turtle_points = np.asarray(
+        turtle_3d(
+            commands,
+            step=step,
+            yaw=np.deg2rad(turn_angle_deg),
+            pitch=np.deg2rad(turn_angle_deg),
+        ),
+        dtype=float,
+    )
+    turtle_points_centered = turtle_points - turtle_points.mean(axis=0, keepdims=True)
+
+    atom_extent = np.max(np.linalg.norm(atom_points_centered, axis=1)) if len(atom_points_centered) else 0.0
+    turtle_extent = np.max(np.linalg.norm(turtle_points_centered, axis=1)) if len(turtle_points_centered) else 0.0
+    scale = (atom_extent / turtle_extent) if turtle_extent > 1e-12 else 1.0
+    turtle_points_aligned = turtle_points_centered * scale
+
+    pl = pv.Plotter(notebook=notebook)
+    pl.set_background("white")
+
+    element_colors = {
+        "C": "dimgray",
+        "N": "royalblue",
+        "O": "tomato",
+        "S": "goldenrod",
+        "H": "lightgray",
+    }
+
+    elements = np.array([str(a["element"]).upper() for a in atoms], dtype=object)
+    for elem in sorted(set(elements.tolist())):
+        idx = np.where(elements == elem)[0]
+        if idx.size == 0:
+            continue
+        cloud = pv.PolyData(atom_points_centered[idx])
+        pl.add_points(
+            cloud,
+            color=element_colors.get(elem, "seagreen"),
+            point_size=12.0 if elem != "H" else 8.0,
+            render_points_as_spheres=True,
+            label=f"{elem} atoms",
+        )
+
+    if len(turtle_points_aligned) >= 2:
+        path = pv.lines_from_points(turtle_points_aligned, close=False)
+        pl.add_mesh(path, color="crimson", line_width=4, label="Turtle path")
+    pl.add_points(
+        turtle_points_aligned,
+        color="crimson",
+        point_size=6,
+        render_points_as_spheres=True,
+        opacity=0.6,
+    )
+
+    pl.add_axes()
+    pl.show_grid()
+    pl.add_legend()
+    pl.add_title(
+        f"{aa} | atoms={len(atom_points_centered)} | turtle_pts={len(turtle_points_aligned)} | angle={turn_angle_deg}deg"
+    )
+    pl.show()
+    return atom_points_centered, turtle_points_aligned, commands
+
 # Example usage:
 # points = np.array([...])  # (N,3)
 # radii = sequential_spheres(points, r1_mode="half_next", eps=1e-9)
 
-genome_seed = 40
+genome_seed = 10
 genome_length = 100000  # choose any length; use multiples of 3 to consume full genome
-points_per_codon = 30
-step = 6.0
+step = 4.0
+turn_angle_deg = 30.0
+include_hydrogens = True
 start_codon = "111"
 stop_codon = "333"
-target_points = 50_000
+target_points = 50000
 max_genes = 1000
+amino_cache_dir = ".algogen_cache"
+force_refresh_amino_shapes = False
+force_rebuild_amino_program_cache = False
+run_mutation_experiment = False
+mutation_count = 5
+mutation_seed = 42
+preview_amino_acid: str | None = None  # e.g. "TRP"
 
 genome = generate_random_genome(genome_length, genome_seed)
-amino_programs = build_amino_programs(points_per_codon=points_per_codon)
-expanded, genes = expand_genome_start_stop(
+(
+    amino_programs,
+    codon_to_amino,
+    amino_program_cache_path,
+    amino_program_cache_status,
+    amino_shape_cache_path,
+    amino_shape_cache_status,
+) = load_or_build_real_amino_programs(
+    cache_dir=amino_cache_dir,
+    include_hydrogens=include_hydrogens,
+    turn_angle_deg=turn_angle_deg,
+    force_rebuild=force_rebuild_amino_program_cache,
+    force_refresh_shapes=force_refresh_amino_shapes,
+)
+yaw = np.deg2rad(turn_angle_deg)
+pitch = np.deg2rad(turn_angle_deg)
+expanded, genes, points = run_pipeline_for_genome(
     genome,
     amino_programs,
+    step=step,
+    yaw=yaw,
+    pitch=pitch,
     start_codon=start_codon,
     stop_codon=stop_codon,
     target_points=target_points,
     max_genes=max_genes,
 )
-points = turtle_3d(expanded, step=step, max_points=target_points)
 print(
     f"seed={genome_seed}, genome_len={genome_length}, genes={len(genes)}, "
-    f"start={start_codon}, stop={stop_codon}, step={step}, points={len(points)}"
+    f"start={start_codon}, stop={stop_codon}, step={step}, "
+    f"turn_angle_deg={turn_angle_deg}, points={len(points)}"
+)
+print(
+    f"amino_shape_cache={amino_shape_cache_status} path={amino_shape_cache_path}"
+)
+print(
+    f"amino_program_cache={amino_program_cache_status} path={amino_program_cache_path}"
+)
+print(
+    "codon_mapping_sample="
+    + ", ".join(f"{c}->{codon_to_amino[c]}" for c in all_codons()[:9])
 )
 if genes:
     for i, gene in enumerate(genes, start=1):
@@ -400,7 +863,47 @@ if genes:
         )
 else:
     print("No START/STOP genes found.")
-# plot_spheres_matplotlib(points, radii,
-#                         sphere_resolution=14,
-#                         alpha=0.4)
-show_spheres_pyvista(points, 2*np.ones(len(points)), sphere_theta=12, sphere_phi=12, opacity=0.2)    
+
+if run_mutation_experiment:
+    mutated_genome, mutations = mutate_genome(
+        genome, mutation_count=mutation_count, seed=mutation_seed
+    )
+    _, mut_genes, mut_points = run_pipeline_for_genome(
+        mutated_genome,
+        amino_programs,
+        step=step,
+        yaw=yaw,
+        pitch=pitch,
+        start_codon=start_codon,
+        stop_codon=stop_codon,
+        target_points=target_points,
+        max_genes=max_genes,
+    )
+    cmp_stats = compare_runs(genes, mut_genes, points, mut_points)
+    print(
+        f"mutation_experiment: count={len(mutations)} seed={mutation_seed} "
+        f"mutated_points={len(mut_points)} mutated_genes={len(mut_genes)}"
+    )
+    for m in mutations:
+        print(f"mutation: index={m['index']} old={m['old']} new={m['new']}")
+    print(
+        f"mutation_effect: overlap_genes={cmp_stats['overlap_genes']} "
+        f"changed_overlap_genes={cmp_stats['changed_overlap_genes']} "
+        f"first_changed_gene={cmp_stats['first_changed_gene']}"
+    )
+    print(
+        f"mutation_effect_points: overlap={cmp_stats['overlap_points']} "
+        f"mean_displacement={cmp_stats['mean_point_displacement']:.6f} "
+        f"max_displacement={cmp_stats['max_point_displacement']:.6f}"
+    )
+
+if preview_amino_acid:
+    show_single_amino_acid_pyvista(
+        preview_amino_acid,
+        cache_dir=amino_cache_dir,
+        include_hydrogens=include_hydrogens,
+        turn_angle_deg=turn_angle_deg,
+        step=step,
+    )
+
+show_spheres_pyvista(points, 2*np.ones(len(points)), sphere_theta=16, sphere_phi=16, opacity=1)    
